@@ -8,8 +8,7 @@ import shutil
 import sys
 
 app = Flask(__name__, static_folder='static')
-CORS(app, origins=["http://localhost:3000"])  # Restrict CORS to specific origins
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit uploads to 16MB
+CORS(app)
 
 # Serve frontend
 @app.route('/')
@@ -23,10 +22,9 @@ def convert_to_gdb():
         return jsonify({"error": "No file uploaded"}), 400
 
     uploaded_file = request.files['file']
-    if uploaded_file.filename == '' or not uploaded_file.filename.endswith('.gpx'):
-        return jsonify({"error": "Invalid file: Please upload a .gpx file"}), 400
+    if uploaded_file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
 
-    temp_dir = None
     try:
         # Create temp directory
         temp_dir = tempfile.mkdtemp()
@@ -39,7 +37,7 @@ def convert_to_gdb():
         
         # Convert using GDAL/OGR
         if not convert_gpx_to_gdb(gpx_path, gdb_path):
-            return jsonify({"error": "Failed to convert GPX to GDB. Please ensure the file is valid."}), 500
+            return jsonify({"error": "Conversion failed"}), 500
 
         # Zip the GDB folder
         zip_path = os.path.join(temp_dir, gdb_name + ".zip")
@@ -53,26 +51,30 @@ def convert_to_gdb():
         return send_file(zip_path, as_attachment=True, download_name=gdb_name + ".zip")
 
     except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
     finally:
-        if temp_dir and os.path.exists(temp_dir):
+        # Cleanup
+        if 'temp_dir' in locals():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 def convert_gpx_to_gdb(gpx_path, output_gdb):
-    gpx_ds = None
-    gdb_ds = None
     try:
+        # Enable GDAL exceptions
         ogr.UseExceptions()
         
+        # Verify GPX file exists
         if not os.path.exists(gpx_path):
-            raise FileNotFoundError("GPX file not found")
+            raise FileNotFoundError(f"GPX file not found: {gpx_path}")
             
+        # Create output directory
         os.makedirs(os.path.dirname(output_gdb), exist_ok=True)
         
-        driver = ogr.GetDriverByName("FileGDB")
+        # Create File Geodatabase
+        driver = ogr.GetDriverByName("FileGDB") or ogr.GetDriverByName("OpenFileGDB")
         if driver is None:
-            raise RuntimeError("FileGDB driver not available. Ensure GDAL is compiled with FileGDB support.")
+            raise RuntimeError("No suitable GDB driver available")
             
+        # Remove existing GDB if it exists
         if os.path.exists(output_gdb):
             driver.DeleteDataSource(output_gdb)
             
@@ -80,27 +82,32 @@ def convert_gpx_to_gdb(gpx_path, output_gdb):
         if gdb_ds is None:
             raise RuntimeError(f"Failed to create GDB at {output_gdb}")
         
+        # Open GPX file
         gpx_ds = ogr.Open(gpx_path)
         if gpx_ds is None:
-            raise RuntimeError("Invalid GPX file")
+            raise RuntimeError(f"Failed to open GPX file: {gpx_path}")
             
+        # Process all layers
         for i in range(gpx_ds.GetLayerCount()):
             layer = gpx_ds.GetLayerByIndex(i)
             if layer.GetFeatureCount() == 0:
                 continue
                 
-            # Map GPX layer types to appropriate geometry types
-            layer_name = layer.GetName()
-            geom_type = layer.GetGeomType()
-            out_layer = gdb_ds.CreateLayer(layer_name, geom_type=geom_type)
+            # Create layer in GDB
+            out_layer = gdb_ds.CreateLayer(
+                layer.GetName(),
+                geom_type=layer.GetGeomType()
+            )
             
             if out_layer is None:
                 continue
                 
+            # Copy fields
             layer_defn = layer.GetLayerDefn()
             for i in range(layer_defn.GetFieldCount()):
                 out_layer.CreateField(layer_defn.GetFieldDefn(i))
                 
+            # Copy features
             feature = layer.GetNextFeature()
             while feature:
                 new_feature = ogr.Feature(out_layer.GetLayerDefn())
@@ -114,9 +121,13 @@ def convert_gpx_to_gdb(gpx_path, output_gdb):
         print(f"Conversion error: {str(e)}", file=sys.stderr)
         return False
     finally:
-        gpx_ds = None  # Ensure data sources are closed
-        gdb_ds = None
+        # Cleanup
+        if 'gpx_ds' in locals():
+            gpx_ds = None
+        if 'gdb_ds' in locals():
+            gdb_ds = None
 
 if __name__ == '__main__':
+    # Create static directory if it doesn't exist
     os.makedirs('static', exist_ok=True)
-    app.run(host='0.0.0.0', port=5000, debug=False)  # Disable debug in production
+    app.run(host='0.0.0.0', port=5000, debug=True)
